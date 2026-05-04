@@ -1,0 +1,176 @@
+﻿name: merchantdemo
+
+version: "3.9"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: merchantdemo-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    build:
+      context: .
+      dockerfile: postgres-primary/Dockerfile.primary
+    container_name: merchantdemo-postgres
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - hot_standby=on
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: merchantdemo
+      POSTGRES_USER: merchant
+      POSTGRES_PASSWORD: merchant
+    volumes:
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h /var/run/postgresql -U merchant -d merchantdemo"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  postgres-replica:
+    build:
+      context: .
+      dockerfile: postgres-replica/Dockerfile.replica
+    container_name: merchantdemo-postgres-replica
+    restart: unless-stopped
+    user: postgres
+    ports:
+      - "5433:5432"
+    environment:
+      PGPASSWORD: replicator
+    command:
+      - bash
+      - /scripts/bootstrap-replica.sh
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h /var/run/postgresql -U merchant -d merchantdemo"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  aggregator:
+    build:
+      context: ..
+      dockerfile: Docker/.Dockerfile
+      args:
+        PROJECT_PATH: Aggregator/Aggregator.csproj
+    container_name: merchantdemo-aggregator
+    command: ["Aggregator.dll"]
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Port: "5672"
+      RabbitMq__UserName: guest
+      RabbitMq__Password: guest
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=merchantaggregates;Username=merchant;Password=merchant
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  eventspublisher:
+    build:
+      context: ..
+      dockerfile: Docker/.Dockerfile
+      args:
+        PROJECT_PATH: EventsPublisher/EventsPublisher.csproj
+    container_name: merchantdemo-eventspublisher
+    command: ["EventsPublisher.dll"]
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Port: "5672"
+      RabbitMq__UserName: guest
+      RabbitMq__Password: guest
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=merchantdemo;Username=merchant;Password=merchant
+      Publisher__StartupDelayMs: "10000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  eventsconsumer:
+    build:
+      context: ..
+      dockerfile: Docker/.Dockerfile
+      args:
+        PROJECT_PATH: EventsConsumer/EventsConsumer.csproj
+    container_name: merchantdemo-eventsconsumer
+    command: ["EventsConsumer.dll"]
+    restart: unless-stopped
+    ports:
+      - "8083:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Port: "5672"
+      RabbitMq__UserName: guest
+      RabbitMq__Password: guest
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=merchantaggregates;Username=merchant;Password=merchant
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  resultapi:
+    build:
+      context: ..
+      dockerfile: Docker/.Dockerfile
+      args:
+        PROJECT_PATH: ResultApi/ResultApi.csproj
+    container_name: merchantdemo-resultapi
+    command: ["ResultApi.dll"]
+    restart: unless-stopped
+    ports:
+      - "8084:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Port: "5672"
+      RabbitMq__UserName: guest
+      RabbitMq__Password: guest
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=merchantdemo;Username=merchant;Password=merchant
+      ConnectionStrings__AggregatesReplica: Host=postgres-replica;Port=5432;Database=merchantaggregates;Username=merchant;Password=merchant
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      postgres-replica:
+        condition: service_healthy
+
