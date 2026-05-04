@@ -2,8 +2,7 @@ using Aggregator.Models;
 using System.Text;
 using System.Text.Json;
 using System.Net.Http.Json;
-using Marten;
-using Weasel.Core;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -13,13 +12,7 @@ if (string.IsNullOrWhiteSpace(replicaConnectionString))
     throw new InvalidOperationException("ConnectionStrings:AggregatesReplica is required for ResultApi");
 }
 
-builder.Services.AddSingleton<IDocumentStore>(_ => DocumentStore.For(options =>
-{
-    options.Connection(replicaConnectionString);
-    options.AutoCreateSchemaObjects = AutoCreate.None;
-    options.Schema.For<ProductAggregate>().Identity(x => x.Id);
-    options.Schema.For<CategoryAggregate>().Identity(x => x.Id);
-}));
+builder.Services.AddSingleton(new NpgsqlDataSourceBuilder(replicaConnectionString).Build());
 
 builder.Services.AddHttpClient("EventsPublisher", client =>
 {
@@ -214,7 +207,7 @@ app.MapPut("/api/aggregator-settings", async (object settings, IHttpClientFactor
     }
 });
 
-app.MapGet("/api/state-counts", async (IHttpClientFactory httpClientFactory, IDocumentStore replicaStore, CancellationToken ct) =>
+app.MapGet("/api/state-counts", async (IHttpClientFactory httpClientFactory, NpgsqlDataSource replicaDataSource, CancellationToken ct) =>
 {
     try
     {
@@ -228,21 +221,11 @@ app.MapGet("/api/state-counts", async (IHttpClientFactory httpClientFactory, IDo
         }
 
         var originalJson = await originalResponse.Content.ReadAsStringAsync();
-        await using var session = replicaStore.QuerySession();
+        await using var connection = await replicaDataSource.OpenConnectionAsync(ct);
 
-        var products = await session.Query<ProductAggregate>().CountAsync(ct);
-        var categories = await session.Query<CategoryAggregate>().CountAsync(ct);
-
-        var productMerchants = await session.Query<ProductAggregate>()
-            .Select(x => x.MerchantId)
-            .ToListAsync(ct);
-        var categoryMerchants = await session.Query<CategoryAggregate>()
-            .Select(x => x.MerchantId)
-            .ToListAsync(ct);
-        var merchants = productMerchants
-            .Concat(categoryMerchants)
-            .Distinct()
-            .Count();
+        var products = await ExecuteCountAsync(connection, "SELECT COUNT(*) FROM \"AggregateProducts\";", ct);
+        var categories = await ExecuteCountAsync(connection, "SELECT COUNT(*) FROM \"AggregateCategories\";", ct);
+        var merchants = await ExecuteCountAsync(connection, "SELECT COUNT(*) FROM \"AggregateMerchants\";", ct);
 
         return Results.Ok(new
         {
@@ -261,23 +244,21 @@ app.MapGet("/api/state-counts", async (IHttpClientFactory httpClientFactory, IDo
     }
 });
 
-app.MapGet("/api/random-merchant", async (IDocumentStore replicaStore, CancellationToken ct) =>
+app.MapGet("/api/random-merchant", async (NpgsqlDataSource replicaDataSource, CancellationToken ct) =>
 {
     try
     {
-        await using var session = replicaStore.QuerySession();
-        var products = await session.Query<ProductAggregate>()
-            .OrderBy(x => x.Id)
-            .ToListAsync(ct);
-        var categories = await session.Query<CategoryAggregate>()
-            .OrderBy(x => x.Id)
-            .ToListAsync(ct);
+        await using var connection = await replicaDataSource.OpenConnectionAsync(ct);
 
-        var merchantIds = products
-            .Select(x => x.MerchantId)
-            .Concat(categories.Select(x => x.MerchantId))
-            .Distinct()
-            .ToList();
+        var merchantIds = new List<int>();
+        await using (var merchantCommand = new NpgsqlCommand("SELECT \"Id\" FROM \"AggregateMerchants\" ORDER BY \"Id\";", connection))
+        await using (var merchantReader = await merchantCommand.ExecuteReaderAsync(ct))
+        {
+            while (await merchantReader.ReadAsync(ct))
+            {
+                merchantIds.Add(merchantReader.GetInt32(0));
+            }
+        }
 
         if (merchantIds.Count == 0)
         {
@@ -286,15 +267,59 @@ app.MapGet("/api/random-merchant", async (IDocumentStore replicaStore, Cancellat
 
         var merchantId = merchantIds[Random.Shared.Next(merchantIds.Count)];
 
-        var merchantCategories = categories
-            .Where(x => x.MerchantId == merchantId)
-            .OrderBy(x => x.Id)
-            .ToList();
+        var merchantCategories = new List<CategoryAggregate>();
+        const string categoriesSql =
+            """
+            SELECT "Id", "MerchantId", "Name", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc"
+            FROM "AggregateCategories"
+            WHERE "MerchantId" = @merchantId
+            ORDER BY "Id";
+            """;
+        await using (var categoriesCommand = new NpgsqlCommand(categoriesSql, connection))
+        {
+            categoriesCommand.Parameters.AddWithValue("merchantId", merchantId);
+            await using var categoriesReader = await categoriesCommand.ExecuteReaderAsync(ct);
+            while (await categoriesReader.ReadAsync(ct))
+            {
+                merchantCategories.Add(new CategoryAggregate
+                {
+                    Id = categoriesReader.GetInt32(0),
+                    MerchantId = categoriesReader.GetInt32(1),
+                    Name = categoriesReader.GetString(2),
+                    LastAction = categoriesReader.GetString(3),
+                    LastOccurredAtUtc = categoriesReader.GetFieldValue<DateTimeOffset>(4),
+                    UpdatedAtUtc = categoriesReader.GetFieldValue<DateTimeOffset>(5)
+                });
+            }
+        }
 
-        var merchantProducts = products
-            .Where(x => x.MerchantId == merchantId)
-            .OrderBy(x => x.Id)
-            .ToList();
+        var merchantProducts = new List<ProductAggregate>();
+        const string productsSql =
+            """
+            SELECT "Id", "MerchantId", "ProductCategoryId", "Name", "Price", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc"
+            FROM "AggregateProducts"
+            WHERE "MerchantId" = @merchantId
+            ORDER BY "Id";
+            """;
+        await using (var productsCommand = new NpgsqlCommand(productsSql, connection))
+        {
+            productsCommand.Parameters.AddWithValue("merchantId", merchantId);
+            await using var productsReader = await productsCommand.ExecuteReaderAsync(ct);
+            while (await productsReader.ReadAsync(ct))
+            {
+                merchantProducts.Add(new ProductAggregate
+                {
+                    Id = productsReader.GetInt32(0),
+                    MerchantId = productsReader.GetInt32(1),
+                    ProductCategoryId = productsReader.IsDBNull(2) ? null : productsReader.GetInt32(2),
+                    Name = productsReader.GetString(3),
+                    Price = productsReader.GetDecimal(4),
+                    LastAction = productsReader.GetString(5),
+                    LastOccurredAtUtc = productsReader.GetFieldValue<DateTimeOffset>(6),
+                    UpdatedAtUtc = productsReader.GetFieldValue<DateTimeOffset>(7)
+                });
+            }
+        }
 
         var categoryIds = merchantCategories.Select(x => x.Id).ToHashSet();
         var productsByCategory = merchantProducts
@@ -360,4 +385,10 @@ app.MapPost("/api/robot-stop", async (IHttpClientFactory httpClientFactory) =>
 });
 
 app.Run();
+
+static async Task<int> ExecuteCountAsync(NpgsqlConnection connection, string sql, CancellationToken ct)
+{
+    await using var command = new NpgsqlCommand(sql, connection);
+    return Convert.ToInt32(await command.ExecuteScalarAsync(ct));
+}
 

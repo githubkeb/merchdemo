@@ -1,13 +1,11 @@
 ﻿using Aggregator.Models;
 using Aggregator.Options;
-using Marten;
 using Microsoft.Extensions.Options;
 using Npgsql;
 
 namespace Aggregator.Services;
 
 public sealed class ProductAggregationHostedService(
-    IDocumentStore store,
     IOptions<AggregatorOptions> options,
     IConfiguration configuration,
     IAggregatorSettings aggregatorSettings,
@@ -50,13 +48,17 @@ public sealed class ProductAggregationHostedService(
 
     private async Task<bool> AggregateBatchAsync(string connectionString, CancellationToken ct)
     {
-        await using var session = store.LightweightSession();
-        var checkpoint = await session.LoadAsync<AggregationCheckpoint>(CheckpointId, ct)
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(ct);
+
+        var checkpoint = await LoadCheckpointAsync(connection, transaction, ct)
                          ?? new AggregationCheckpoint { Id = CheckpointId };
 
-        var events = await LoadNextBatchAsync(connectionString, checkpoint, ct);
+        var events = await LoadNextBatchAsync(connection, transaction, checkpoint, ct);
         if (events.Count == 0)
         {
+            await transaction.CommitAsync(ct);
             return false;
         }
 
@@ -68,16 +70,16 @@ public sealed class ProductAggregationHostedService(
 
         foreach (var productEvent in events)
         {
-            await ApplyEventAsync(session, productEvent, ct);
+            await ApplyEventAsync(connection, transaction, productEvent, ct);
         }
 
         var last = events[^1];
         checkpoint.LastOccurredAtUtc = last.OccurredAtUtc;
         checkpoint.LastMessageId = last.MessageId;
         checkpoint.UpdatedAtUtc = DateTimeOffset.UtcNow;
-        session.Store(checkpoint);
+        await SaveCheckpointAsync(connection, transaction, checkpoint, ct);
 
-        await session.SaveChangesAsync(ct);
+        await transaction.CommitAsync(ct);
         logger.LogInformation("Aggregated {Count} product events", events.Count);
 
         return events.Count >= _options.BatchSize;
@@ -93,14 +95,12 @@ public sealed class ProductAggregationHostedService(
     }
 
     private async Task<List<ProductEventRow>> LoadNextBatchAsync(
-        string connectionString,
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
         AggregationCheckpoint checkpoint,
         CancellationToken ct)
     {
         var events = new List<ProductEventRow>();
-
-        await using var connection = new NpgsqlConnection(connectionString);
-        await connection.OpenAsync(ct);
 
         const string sql =
             """
@@ -122,7 +122,7 @@ public sealed class ProductAggregationHostedService(
             LIMIT @batchSize;
             """;
 
-        await using var command = new NpgsqlCommand(sql, connection);
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
         command.Parameters.AddWithValue("lastOccurredAtUtc", checkpoint.LastOccurredAtUtc);
         command.Parameters.AddWithValue("lastMessageId", checkpoint.LastMessageId);
         command.Parameters.AddWithValue("batchSize", Math.Max(1, _options.BatchSize));
@@ -147,26 +147,138 @@ public sealed class ProductAggregationHostedService(
         return events;
     }
 
-    private static async Task ApplyEventAsync(IDocumentSession session, ProductEventRow productEvent, CancellationToken ct)
+    private static async Task<AggregationCheckpoint?> LoadCheckpointAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        CancellationToken ct)
     {
+        const string sql =
+            """
+            SELECT "Id", "LastOccurredAtUtc", "LastMessageId", "UpdatedAtUtc"
+            FROM "AggregationCheckpoints"
+            WHERE "Id" = @id;
+            """;
+
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
+        command.Parameters.AddWithValue("id", CheckpointId);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+        {
+            return null;
+        }
+
+        return new AggregationCheckpoint
+        {
+            Id = reader.GetString(0),
+            LastOccurredAtUtc = reader.GetFieldValue<DateTimeOffset>(1),
+            LastMessageId = reader.GetString(2),
+            UpdatedAtUtc = reader.GetFieldValue<DateTimeOffset>(3)
+        };
+    }
+
+    private static async Task SaveCheckpointAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        AggregationCheckpoint checkpoint,
+        CancellationToken ct)
+    {
+        const string sql =
+            """
+            INSERT INTO "AggregationCheckpoints" ("Id", "LastOccurredAtUtc", "LastMessageId", "UpdatedAtUtc")
+            VALUES (@id, @lastOccurredAtUtc, @lastMessageId, @updatedAtUtc)
+            ON CONFLICT ("Id") DO UPDATE SET
+                "LastOccurredAtUtc" = EXCLUDED."LastOccurredAtUtc",
+                "LastMessageId" = EXCLUDED."LastMessageId",
+                "UpdatedAtUtc" = EXCLUDED."UpdatedAtUtc";
+            """;
+
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
+        command.Parameters.AddWithValue("id", checkpoint.Id);
+        command.Parameters.AddWithValue("lastOccurredAtUtc", checkpoint.LastOccurredAtUtc);
+        command.Parameters.AddWithValue("lastMessageId", checkpoint.LastMessageId);
+        command.Parameters.AddWithValue("updatedAtUtc", checkpoint.UpdatedAtUtc);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    private static async Task ApplyEventAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        ProductEventRow productEvent,
+        CancellationToken ct)
+    {
+        await UpsertMerchantAsync(connection, transaction, productEvent.MerchantId, ct);
+
         if (string.Equals(productEvent.Action, "deleted", StringComparison.OrdinalIgnoreCase))
         {
-            session.Delete<ProductAggregate>(productEvent.ProductId);
+            const string deleteSql = "DELETE FROM \"AggregateProducts\" WHERE \"Id\" = @id;";
+            await using var deleteCommand = new NpgsqlCommand(deleteSql, connection, transaction);
+            deleteCommand.Parameters.AddWithValue("id", productEvent.ProductId);
+            await deleteCommand.ExecuteNonQueryAsync(ct);
             return;
         }
 
-        var aggregate = await session.LoadAsync<ProductAggregate>(productEvent.ProductId, ct)
-                        ?? new ProductAggregate { Id = productEvent.ProductId };
+        var resolvedCategoryId = productEvent.ProductCategoryId;
+        if (resolvedCategoryId.HasValue && !await CategoryExistsAsync(connection, transaction, resolvedCategoryId.Value, ct))
+        {
+            resolvedCategoryId = null;
+        }
 
-        aggregate.MerchantId = productEvent.MerchantId;
-        aggregate.ProductCategoryId = productEvent.ProductCategoryId;
-        aggregate.Name = productEvent.Name;
-        aggregate.Price = productEvent.Price;
-        aggregate.LastAction = productEvent.Action;
-        aggregate.LastOccurredAtUtc = productEvent.OccurredAtUtc;
-        aggregate.UpdatedAtUtc = DateTimeOffset.UtcNow;
+        const string upsertSql =
+            """
+            INSERT INTO "AggregateProducts" (
+                "Id", "MerchantId", "ProductCategoryId", "Name", "Price", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc")
+            VALUES (@id, @merchantId, @productCategoryId, @name, @price, @lastAction, @lastOccurredAtUtc, @updatedAtUtc)
+            ON CONFLICT ("Id") DO UPDATE SET
+                "MerchantId" = EXCLUDED."MerchantId",
+                "ProductCategoryId" = EXCLUDED."ProductCategoryId",
+                "Name" = EXCLUDED."Name",
+                "Price" = EXCLUDED."Price",
+                "LastAction" = EXCLUDED."LastAction",
+                "LastOccurredAtUtc" = EXCLUDED."LastOccurredAtUtc",
+                "UpdatedAtUtc" = EXCLUDED."UpdatedAtUtc";
+            """;
 
-        session.Store(aggregate);
+        await using var command = new NpgsqlCommand(upsertSql, connection, transaction);
+        command.Parameters.AddWithValue("id", productEvent.ProductId);
+        command.Parameters.AddWithValue("merchantId", productEvent.MerchantId);
+        command.Parameters.AddWithValue("productCategoryId", (object?)resolvedCategoryId ?? DBNull.Value);
+        command.Parameters.AddWithValue("name", productEvent.Name);
+        command.Parameters.AddWithValue("price", productEvent.Price);
+        command.Parameters.AddWithValue("lastAction", productEvent.Action);
+        command.Parameters.AddWithValue("lastOccurredAtUtc", productEvent.OccurredAtUtc);
+        command.Parameters.AddWithValue("updatedAtUtc", DateTimeOffset.UtcNow);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    private static async Task<bool> CategoryExistsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        int categoryId,
+        CancellationToken ct)
+    {
+        const string sql = "SELECT EXISTS (SELECT 1 FROM \"AggregateCategories\" WHERE \"Id\" = @id);";
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
+        command.Parameters.AddWithValue("id", categoryId);
+        return Convert.ToBoolean(await command.ExecuteScalarAsync(ct));
+    }
+
+    private static async Task UpsertMerchantAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        int merchantId,
+        CancellationToken ct)
+    {
+        const string sql =
+            """
+            INSERT INTO "AggregateMerchants" ("Id", "UpdatedAtUtc")
+            VALUES (@id, @updatedAtUtc)
+            ON CONFLICT ("Id") DO UPDATE SET
+                "UpdatedAtUtc" = EXCLUDED."UpdatedAtUtc";
+            """;
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
+        command.Parameters.AddWithValue("id", merchantId);
+        command.Parameters.AddWithValue("updatedAtUtc", DateTimeOffset.UtcNow);
+        await command.ExecuteNonQueryAsync(ct);
     }
 }
 
