@@ -6,7 +6,6 @@ public interface IRobotSettings
     int MaxMerchants { get; }
     int MaxCategories { get; }
     int MaxProducts { get; }
-    int CategorylessProductProbabilityPercent { get; }
     bool IsEnabled { get; }
 }
 
@@ -22,7 +21,6 @@ public sealed class RobotSettings
     public int MaxMerchants { get; set; } = 50;
     public int MaxCategories { get; set; } = 10;
     public int MaxProducts { get; set; } = 30;
-    public int CategorylessProductProbabilityPercent { get; set; } = 35;
     public bool IsEnabled { get; set; } = true;
 }
 
@@ -76,17 +74,6 @@ public sealed class RobotSettingsStore : IRobotSettingsManager
         }
     }
 
-    public int CategorylessProductProbabilityPercent
-    {
-        get
-        {
-            lock (_sync)
-            {
-                return _current.CategorylessProductProbabilityPercent;
-            }
-        }
-    }
-
     public bool IsEnabled
     {
         get
@@ -127,7 +114,6 @@ public sealed class RobotSettingsStore : IRobotSettingsManager
             MaxMerchants = settings.MaxMerchants,
             MaxCategories = settings.MaxCategories,
             MaxProducts = settings.MaxProducts,
-            CategorylessProductProbabilityPercent = settings.CategorylessProductProbabilityPercent,
             IsEnabled = settings.IsEnabled
         };
 }

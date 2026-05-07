@@ -9,8 +9,9 @@ namespace EventsPublisher;
 
 public class MerchantRobot
 {
+    private const int TargetMerchantId = 1;
     private const int NewMerchantProbabilityPercent = 25;
-    private const int ProductsPerStep = 5;
+    private const int ProductsPerStep = 10;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IRobotSettings _settings;
@@ -46,15 +47,14 @@ public class MerchantRobot
                 var dbContext = scope.ServiceProvider.GetRequiredService<MerchantDbContext>();
 
 
-                var merchant = await EnsureMerchantAsync(dbContext, ct);
+                var preferredMerchant = await EnsureMerchantAsync(dbContext, TargetMerchantId, ct);
+                await ProcessMerchantAsync(dbContext, preferredMerchant, ct);
 
-                await AddCategoryAsync(dbContext, merchant, ct);
-                await ModifyCategoryAsync(dbContext, merchant, ct);
-                for (var i = 0; i < ProductsPerStep; i++)
+                var randomMerchant = await EnsureRandomMerchantAsync(dbContext, ct);
+                if (randomMerchant.Id != preferredMerchant.Id)
                 {
-                    await AddProductAsync(dbContext, merchant, ct);
+                    await ProcessMerchantAsync(dbContext, randomMerchant, ct);
                 }
-                await ModifyProductAsync(dbContext, merchant, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -69,7 +69,45 @@ public class MerchantRobot
         }
     }
 
-    private async Task<Merchant> EnsureMerchantAsync(MerchantDbContext dbContext, CancellationToken ct)
+    private async Task<Merchant> EnsureMerchantAsync(MerchantDbContext dbContext, int preferredMerchantId, CancellationToken ct)
+    {
+        var preferredMerchant = await dbContext.Merchants.FirstOrDefaultAsync(x => x.Id == preferredMerchantId, ct);
+        if (preferredMerchant is not null)
+        {
+            return preferredMerchant;
+        }
+
+        var merchantsCount = await dbContext.Merchants.CountAsync(ct);
+        var maxMerchants = _settings.MaxMerchants;
+        var canCreateMore = maxMerchants <= 0 || merchantsCount < maxMerchants;
+        var shouldCreateNew = merchantsCount == 0 ||
+                              (canCreateMore && Random.Shared.Next(100) < NewMerchantProbabilityPercent);
+
+        if (shouldCreateNew)
+        {
+            var now = DateTimeOffset.UtcNow;
+            var merchant = new Merchant
+            {
+                Name = $"Merchant-{RandomSuffix()}",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            };
+
+            dbContext.Merchants.Add(merchant);
+            await dbContext.SaveChangesAsync(ct);
+
+            _logger.LogInformation("Created merchant {MerchantId} ({MerchantName})", merchant.Id, merchant.Name);
+            return merchant;
+        }
+
+        var randomIndex = Random.Shared.Next(merchantsCount);
+        return await dbContext.Merchants
+            .OrderBy(x => x.CreatedAtUtc)
+            .Skip(randomIndex)
+            .FirstAsync(ct);
+    }
+
+    private async Task<Merchant> EnsureRandomMerchantAsync(MerchantDbContext dbContext, CancellationToken ct)
     {
         var merchantsCount = await dbContext.Merchants.CountAsync(ct);
         var maxMerchants = _settings.MaxMerchants;
@@ -99,6 +137,17 @@ public class MerchantRobot
             .OrderBy(x => x.CreatedAtUtc)
             .Skip(randomIndex)
             .FirstAsync(ct);
+    }
+
+    private async Task ProcessMerchantAsync(MerchantDbContext dbContext, Merchant merchant, CancellationToken ct)
+    {
+        await AddCategoryAsync(dbContext, merchant, ct);
+        await ModifyCategoryAsync(dbContext, merchant, ct);
+        for (var i = 0; i < ProductsPerStep; i++)
+        {
+            await AddProductAsync(dbContext, merchant, ct);
+        }
+        await ModifyProductAsync(dbContext, merchant, ct);
     }
 
     private async Task AddCategoryAsync(MerchantDbContext dbContext, Merchant merchant, CancellationToken ct)
@@ -166,12 +215,19 @@ public class MerchantRobot
             .Where(x => x.MerchantId == merchant.Id)
             .ToListAsync(ct);
 
+        if (categories.Count == 0)
+        {
+            return;
+        }
+
         var categoryId = SelectCategoryId(categories);
+        var nextSortOrder = await GetNextSortOrderAsync(dbContext, merchant.Id, ct);
         var now = DateTimeOffset.UtcNow;
         var product = new Product
         {
             MerchantId = merchant.Id,
             MerchantCategoryId = categoryId,
+            SortOrder = nextSortOrder,
             Name = $"Product-{RandomSuffix()}",
             Price = RandomPrice(),
             CreatedAtUtc = now,
@@ -195,16 +251,11 @@ public class MerchantRobot
             return;
         }
 
-        var categories = await dbContext.MerchantCategories
-            .Where(x => x.MerchantId == merchant.Id)
-            .ToListAsync(ct);
-
         var product = products[Random.Shared.Next(products.Count)];
         var now = DateTimeOffset.UtcNow;
 
         product.Name = $"Product-{RandomSuffix()}";
         product.Price = RandomPrice();
-        product.MerchantCategoryId = SelectCategoryId(categories);
         product.UpdatedAtUtc = now;
 
         await dbContext.SaveChangesAsync(ct);
@@ -221,6 +272,7 @@ public class MerchantRobot
                 product.Id,
                 product.MerchantId,
                 product.MerchantCategoryId,
+                product.SortOrder,
                 product.Name,
                 product.Price,
                 action,
@@ -228,15 +280,19 @@ public class MerchantRobot
             ct);
     }
 
+    private static async Task<int> GetNextSortOrderAsync(MerchantDbContext dbContext, int merchantId, CancellationToken ct)
+    {
+        var maxSortOrder = await dbContext.Products
+            .Where(x => x.MerchantId == merchantId)
+            .Select(x => (int?)x.SortOrder)
+            .MaxAsync(ct);
+
+        return (maxSortOrder ?? 0) + 1;
+    }
+
     private int? SelectCategoryId(IReadOnlyList<MerchantCategory> categories)
     {
         if (categories.Count == 0)
-        {
-            return null;
-        }
-
-        var shouldLeaveWithoutCategory = Random.Shared.Next(100) < _settings.CategorylessProductProbabilityPercent;
-        if (shouldLeaveWithoutCategory)
         {
             return null;
         }

@@ -44,6 +44,7 @@ services:
       POSTGRES_USER: merchant
       POSTGRES_PASSWORD: merchant
     volumes:
+      - postgres-data:/var/lib/postgresql/data
       - ./postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h /var/run/postgresql -U merchant -d merchantdemo"]
@@ -65,6 +66,8 @@ services:
     command:
       - bash
       - /scripts/bootstrap-replica.sh
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -173,4 +176,8 @@ services:
         condition: service_healthy
       postgres-replica:
         condition: service_healthy
+
+volumes:
+  postgres-data:
+  postgres-replica-data:
 

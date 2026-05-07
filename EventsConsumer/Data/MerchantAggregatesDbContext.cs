@@ -16,6 +16,7 @@ public sealed class MerchantAggregatesDbContext(DbContextOptions<MerchantAggrega
             entity.Property(x => x.MessageId).HasMaxLength(256).IsRequired();
             entity.Property(x => x.Name).HasMaxLength(200).IsRequired();
             entity.Property(x => x.Action).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.SortOrder).IsRequired();
             entity.Property(x => x.Price).HasPrecision(18, 2);
             entity.Property(x => x.OccurredAtUtc).IsRequired();
             entity.Property(x => x.ReceivedAtUtc).IsRequired();

@@ -43,6 +43,7 @@ public sealed class MerchantDbContext(DbContextOptions<MerchantDbContext> option
             entity.Property(x => x.Id).UseIdentityColumn();
             entity.Property(x => x.Name).HasMaxLength(200).IsRequired();
             entity.Property(x => x.Price).HasPrecision(18, 2);
+            entity.Property(x => x.SortOrder).IsRequired();
             entity.Property(x => x.CreatedAtUtc).IsRequired();
             entity.Property(x => x.UpdatedAtUtc).IsRequired();
 

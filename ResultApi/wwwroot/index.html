@@ -245,6 +245,31 @@
         <div class="button-group" style="margin-top: 0; margin-bottom: 12px;">
             <button type="button" class="btn-secondary" onclick="loadRandomMerchant()">Load Random Merchant</button>
         </div>
+        <div class="input-group" style="margin-bottom: 12px;">
+            <div class="form-group" style="margin-bottom: 0;">
+                <label for="merchantIdInput">Merchant Id</label>
+                <input type="number" id="merchantIdInput" name="merchantIdInput" step="1" min="1" placeholder="e.g. 1">
+            </div>
+            <div class="form-group" style="margin-bottom: 0; display: flex; align-items: end;">
+                <button type="button" class="btn-secondary" onclick="loadMerchantById()">Load Merchant By ID</button>
+            </div>
+        </div>
+        <div class="input-group" style="margin-bottom: 12px;">
+            <div class="form-group" style="margin-bottom: 0;">
+                <label for="productsPage">Products Page</label>
+                <input type="number" id="productsPage" name="productsPage" step="1" min="1" value="1">
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+                <label for="productsPageSize">Products Page Size</label>
+                <input type="number" id="productsPageSize" name="productsPageSize" step="1" min="1" max="100" value="10">
+            </div>
+        </div>
+        <div class="input-group" style="margin-bottom: 12px;">
+            <div class="form-group" style="margin-bottom: 0;">
+                <label for="categoryIdInput">Category Id</label>
+                <input type="number" id="categoryIdInput" name="categoryIdInput" step="1" min="1" placeholder="e.g. 15">
+            </div>
+        </div>
         <div class="timing" id="merchantTiming">Request time: -</div>
         <div class="merchant-result" id="merchantResult">No data loaded yet.</div>
         <div class="status" id="merchantStatus"></div>
@@ -275,12 +300,6 @@
                     <input type="number" id="maxProducts" name="maxProducts" step="1" required>
                     <div class="help-text">Any integer value</div>
                 </div>
-            </div>
-            
-            <div class="form-group">
-                <label for="categorylessProductProbabilityPercent">Categoryless Product Probability (%)</label>
-                <input type="number" id="categorylessProductProbabilityPercent" name="categorylessProductProbabilityPercent" step="1" required>
-                <div class="help-text">Any integer value</div>
             </div>
             
             <div class="button-group">
@@ -366,44 +385,76 @@
             return Number(value).toFixed(2);
         }
 
+        function readProductsPaging() {
+            const page = parseInt(document.getElementById('productsPage').value, 10);
+            const pageSize = parseInt(document.getElementById('productsPageSize').value, 10);
+
+            return {
+                page: Number.isFinite(page) && page > 0 ? page : 1,
+                pageSize: Number.isFinite(pageSize) && pageSize > 0 ? pageSize : 10
+            };
+        }
+
+        function readCategoryFilter() {
+            const rawCategoryId = document.getElementById('categoryIdInput').value;
+            const categoryId = parseInt(rawCategoryId, 10);
+
+            return {
+                categoryId: Number.isFinite(categoryId) && categoryId > 0 ? categoryId : null
+            };
+        }
+
         function renderRandomMerchant(data) {
             const merchantResult = document.getElementById('merchantResult');
             const categories = data.categories || [];
-            const uncategorizedProducts = data.uncategorizedProducts || [];
+            const filters = data.filters || {};
+            const activeFiltersText = [
+                filters.categoryId ? `categoryId=${filters.categoryId}` : null
+            ].filter(Boolean).join(', ');
 
             const categoriesHtml = categories.length === 0
                 ? '<div>No categories</div>'
                 : categories.map(category => {
                     const products = category.products || [];
+                    const pagination = category.pagination || null;
+                    const paginationText = pagination
+                        ? ` <small>(page ${pagination.page}/${pagination.totalPages || 0}, total ${pagination.total})</small>`
+                        : '';
                     const productsHtml = products.length === 0
                         ? '<li>No products</li>'
-                        : products.map(product => `<li>#${product.id} ${product.name} ($${formatPrice(product.price)})</li>`).join('');
+                        : products.map(product => `<li>#${product.id} [order: ${product.sortOrder}] ${product.name} ($${formatPrice(product.price)})</li>`).join('');
 
                     return `
-                        <h4>Category #${category.id}: ${category.name}</h4>
+                        <h4>Category #${category.id}: ${category.name}${paginationText}</h4>
                         <ul>${productsHtml}</ul>
                     `;
                 }).join('');
 
-            const uncategorizedHtml = uncategorizedProducts.length === 0
-                ? '<div>No uncategorized products</div>'
-                : `<ul>${uncategorizedProducts.map(product => `<li>#${product.id} ${product.name} ($${formatPrice(product.price)})</li>`).join('')}</ul>`;
-
             merchantResult.innerHTML = `
                 <div><strong>Merchant:</strong> ${data.merchantId}</div>
+                <div><strong>Category filters:</strong> ${activeFiltersText || 'none'}</div>
                 <h4>Categories and Products</h4>
                 ${categoriesHtml}
-                <h4>Uncategorized Products</h4>
-                ${uncategorizedHtml}
             `;
         }
 
         async function loadRandomMerchant() {
             const start = performance.now();
+            const paging = readProductsPaging();
+            const categoryFilter = readCategoryFilter();
             showStatus('merchantStatus', 'Loading random merchant...', 'loading');
 
             try {
-                const response = await fetch(`${API_BASE}/api/random-merchant`);
+                const query = new URLSearchParams({
+                    page: String(paging.page),
+                    pageSize: String(paging.pageSize)
+                });
+
+                if (categoryFilter.categoryId) {
+                    query.set('categoryId', String(categoryFilter.categoryId));
+                }
+
+                const response = await fetch(`${API_BASE}/api/random-merchant?${query.toString()}`);
                 const elapsedMs = performance.now() - start;
                 document.getElementById('merchantTiming').textContent = `Request time: ${elapsedMs.toFixed(1)} ms`;
 
@@ -425,6 +476,52 @@
                 showStatus('merchantStatus', `Error loading random merchant: ${error.message}`, 'error');
             }
         }
+
+        async function loadMerchantById() {
+            const merchantId = parseInt(document.getElementById('merchantIdInput').value, 10);
+            const paging = readProductsPaging();
+            const categoryFilter = readCategoryFilter();
+
+            if (!Number.isFinite(merchantId) || merchantId <= 0) {
+                showStatus('merchantStatus', 'Please enter a valid Merchant Id (> 0)', 'error');
+                return;
+            }
+
+            const start = performance.now();
+            showStatus('merchantStatus', `Loading merchant ${merchantId}...`, 'loading');
+
+            try {
+                const query = new URLSearchParams({
+                    page: String(paging.page),
+                    pageSize: String(paging.pageSize)
+                });
+
+                if (categoryFilter.categoryId) {
+                    query.set('categoryId', String(categoryFilter.categoryId));
+                }
+
+                const response = await fetch(`${API_BASE}/api/merchant/${merchantId}?${query.toString()}`);
+                const elapsedMs = performance.now() - start;
+                document.getElementById('merchantTiming').textContent = `Request time: ${elapsedMs.toFixed(1)} ms`;
+
+                if (response.status === 404) {
+                    const payload = await response.json();
+                    document.getElementById('merchantResult').textContent = payload.message || `Merchant ${merchantId} not found`;
+                    showStatus('merchantStatus', 'Merchant not found in aggregates', 'error');
+                    return;
+                }
+
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                const payload = await response.json();
+                renderRandomMerchant(payload);
+                showStatus('merchantStatus', `Merchant ${merchantId} loaded successfully`, 'success');
+            } catch (error) {
+                const elapsedMs = performance.now() - start;
+                document.getElementById('merchantTiming').textContent = `Request time: ${elapsedMs.toFixed(1)} ms`;
+                showStatus('merchantStatus', `Error loading merchant: ${error.message}`, 'error');
+            }
+        }
         
         async function loadRobotSettings() {
             showStatus('robotStatus', 'Loading robot settings...', 'loading');
@@ -437,7 +534,6 @@
                 document.getElementById('maxMerchants').value = settings.maxMerchants;
                 document.getElementById('maxCategories').value = settings.maxCategories;
                 document.getElementById('maxProducts').value = settings.maxProducts;
-                document.getElementById('categorylessProductProbabilityPercent').value = settings.categorylessProductProbabilityPercent;
                 
                 showStatus('robotStatus', 'Robot settings loaded successfully', 'success');
             } catch (error) {
@@ -485,8 +581,7 @@
                 waitBetweenLoopsMs: parseInt(document.getElementById('waitBetweenLoopsMs').value),
                 maxMerchants: parseInt(document.getElementById('maxMerchants').value),
                 maxCategories: parseInt(document.getElementById('maxCategories').value),
-                maxProducts: parseInt(document.getElementById('maxProducts').value),
-                categorylessProductProbabilityPercent: parseInt(document.getElementById('categorylessProductProbabilityPercent').value)
+                maxProducts: parseInt(document.getElementById('maxProducts').value)
             };
             
             showStatus('robotStatus', 'Saving robot settings...', 'loading');

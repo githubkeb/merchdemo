@@ -4,6 +4,7 @@ public sealed record ProductMessage(
     int ProductId,
     int MerchantId,
     int? ProductCategoryId,
+    int SortOrder,
     string Name,
     decimal Price,
     string Action,

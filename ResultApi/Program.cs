@@ -244,10 +244,30 @@ app.MapGet("/api/state-counts", async (IHttpClientFactory httpClientFactory, Npg
     }
 });
 
-app.MapGet("/api/random-merchant", async (NpgsqlDataSource replicaDataSource, CancellationToken ct) =>
+app.MapGet("/api/merchant/{merchantId:int}", async (
+    int merchantId,
+    int? page,
+    int? pageSize,
+    int? categoryId,
+    NpgsqlDataSource replicaDataSource,
+    CancellationToken ct) =>
 {
     try
     {
+        var pagination = NormalizePagination(page, pageSize);
+        return await LoadMerchantAggregateAsync(replicaDataSource, merchantId, pagination.Page, pagination.PageSize, categoryId, ct);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.Message);
+    }
+});
+
+app.MapGet("/api/random-merchant", async (int? page, int? pageSize, int? categoryId, NpgsqlDataSource replicaDataSource, CancellationToken ct) =>
+{
+    try
+    {
+        var pagination = NormalizePagination(page, pageSize);
         await using var connection = await replicaDataSource.OpenConnectionAsync(ct);
 
         var merchantIds = new List<int>();
@@ -266,97 +286,7 @@ app.MapGet("/api/random-merchant", async (NpgsqlDataSource replicaDataSource, Ca
         }
 
         var merchantId = merchantIds[Random.Shared.Next(merchantIds.Count)];
-
-        var merchantCategories = new List<CategoryAggregate>();
-        const string categoriesSql =
-            """
-            SELECT "Id", "MerchantId", "Name", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc"
-            FROM "AggregateCategories"
-            WHERE "MerchantId" = @merchantId
-            ORDER BY "Id";
-            """;
-        await using (var categoriesCommand = new NpgsqlCommand(categoriesSql, connection))
-        {
-            categoriesCommand.Parameters.AddWithValue("merchantId", merchantId);
-            await using var categoriesReader = await categoriesCommand.ExecuteReaderAsync(ct);
-            while (await categoriesReader.ReadAsync(ct))
-            {
-                merchantCategories.Add(new CategoryAggregate
-                {
-                    Id = categoriesReader.GetInt32(0),
-                    MerchantId = categoriesReader.GetInt32(1),
-                    Name = categoriesReader.GetString(2),
-                    LastAction = categoriesReader.GetString(3),
-                    LastOccurredAtUtc = categoriesReader.GetFieldValue<DateTimeOffset>(4),
-                    UpdatedAtUtc = categoriesReader.GetFieldValue<DateTimeOffset>(5)
-                });
-            }
-        }
-
-        var merchantProducts = new List<ProductAggregate>();
-        const string productsSql =
-            """
-            SELECT "Id", "MerchantId", "ProductCategoryId", "Name", "Price", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc"
-            FROM "AggregateProducts"
-            WHERE "MerchantId" = @merchantId
-            ORDER BY "Id";
-            """;
-        await using (var productsCommand = new NpgsqlCommand(productsSql, connection))
-        {
-            productsCommand.Parameters.AddWithValue("merchantId", merchantId);
-            await using var productsReader = await productsCommand.ExecuteReaderAsync(ct);
-            while (await productsReader.ReadAsync(ct))
-            {
-                merchantProducts.Add(new ProductAggregate
-                {
-                    Id = productsReader.GetInt32(0),
-                    MerchantId = productsReader.GetInt32(1),
-                    ProductCategoryId = productsReader.IsDBNull(2) ? null : productsReader.GetInt32(2),
-                    Name = productsReader.GetString(3),
-                    Price = productsReader.GetDecimal(4),
-                    LastAction = productsReader.GetString(5),
-                    LastOccurredAtUtc = productsReader.GetFieldValue<DateTimeOffset>(6),
-                    UpdatedAtUtc = productsReader.GetFieldValue<DateTimeOffset>(7)
-                });
-            }
-        }
-
-        var categoryIds = merchantCategories.Select(x => x.Id).ToHashSet();
-        var productsByCategory = merchantProducts
-            .Where(x => x.ProductCategoryId.HasValue && categoryIds.Contains(x.ProductCategoryId.Value))
-            .GroupBy(x => x.ProductCategoryId!.Value)
-            .ToDictionary(
-                x => x.Key,
-                x => x.Select(p => new
-                {
-                    id = p.Id,
-                    name = p.Name,
-                    price = p.Price
-                }).ToList());
-
-        var categoryResult = merchantCategories.Select(category => new
-        {
-            id = category.Id,
-            name = category.Name,
-            products = productsByCategory.GetValueOrDefault(category.Id, [])
-        }).ToList();
-
-        var uncategorizedProducts = merchantProducts
-            .Where(x => !x.ProductCategoryId.HasValue || !categoryIds.Contains(x.ProductCategoryId.Value))
-            .Select(p => new
-            {
-                id = p.Id,
-                name = p.Name,
-                price = p.Price
-            })
-            .ToList();
-
-        return Results.Ok(new
-        {
-            merchantId,
-            categories = categoryResult,
-            uncategorizedProducts
-        });
+        return await LoadMerchantAggregateAsync(replicaDataSource, merchantId, pagination.Page, pagination.PageSize, categoryId, ct);
     }
     catch (Exception ex)
     {
@@ -390,5 +320,159 @@ static async Task<int> ExecuteCountAsync(NpgsqlConnection connection, string sql
 {
     await using var command = new NpgsqlCommand(sql, connection);
     return Convert.ToInt32(await command.ExecuteScalarAsync(ct));
+}
+
+static (int Page, int PageSize) NormalizePagination(int? page, int? pageSize)
+{
+    var normalizedPage = page.GetValueOrDefault(1);
+    if (normalizedPage < 1)
+    {
+        normalizedPage = 1;
+    }
+
+    var normalizedPageSize = pageSize.GetValueOrDefault(10);
+    normalizedPageSize = Math.Clamp(normalizedPageSize, 1, 100);
+
+    return (normalizedPage, normalizedPageSize);
+}
+
+static async Task<IResult> LoadMerchantAggregateAsync(
+    NpgsqlDataSource replicaDataSource,
+    int merchantId,
+    int page,
+    int pageSize,
+    int? categoryId,
+    CancellationToken ct)
+{
+    await using var connection = await replicaDataSource.OpenConnectionAsync(ct);
+
+    var exists = false;
+    await using (var existsCommand = new NpgsqlCommand("SELECT EXISTS (SELECT 1 FROM \"AggregateMerchants\" WHERE \"Id\" = @merchantId);", connection))
+    {
+        existsCommand.Parameters.AddWithValue("merchantId", merchantId);
+        exists = Convert.ToBoolean(await existsCommand.ExecuteScalarAsync(ct));
+    }
+
+    if (!exists)
+    {
+        return Results.NotFound(new { message = $"Merchant {merchantId} not found in aggregates" });
+    }
+
+    var merchantCategories = new List<CategoryAggregate>();
+    const string categoriesSql =
+        """
+        SELECT "Id", "MerchantId", "Name", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc"
+        FROM "AggregateCategories"
+        WHERE "MerchantId" = @merchantId
+        ORDER BY "Id";
+        """;
+    await using (var categoriesCommand = new NpgsqlCommand(categoriesSql, connection))
+    {
+        categoriesCommand.Parameters.AddWithValue("merchantId", merchantId);
+        await using var categoriesReader = await categoriesCommand.ExecuteReaderAsync(ct);
+        while (await categoriesReader.ReadAsync(ct))
+        {
+            merchantCategories.Add(new CategoryAggregate
+            {
+                Id = categoriesReader.GetInt32(0),
+                MerchantId = categoriesReader.GetInt32(1),
+                Name = categoriesReader.GetString(2),
+                LastAction = categoriesReader.GetString(3),
+                LastOccurredAtUtc = categoriesReader.GetFieldValue<DateTimeOffset>(4),
+                UpdatedAtUtc = categoriesReader.GetFieldValue<DateTimeOffset>(5)
+            });
+        }
+    }
+
+    var filteredCategories = merchantCategories
+        .Where(x => !categoryId.HasValue || x.Id == categoryId.Value)
+        .ToList();
+
+    var offset = (page - 1) * pageSize;
+    var categoryResult = new List<object>(filteredCategories.Count);
+    foreach (var category in filteredCategories)
+    {
+        var total = await ExecuteCountByCategoryAsync(connection, merchantId, category.Id, ct);
+        var totalPages = total == 0 ? 0 : (int)Math.Ceiling(total / (double)pageSize);
+        var pagedProducts = await LoadCategoryPageAsync(connection, merchantId, category.Id, offset, pageSize, ct);
+
+        categoryResult.Add(new
+        {
+            id = category.Id,
+            name = category.Name,
+            pagination = new
+            {
+                page,
+                pageSize,
+                total,
+                totalPages
+            },
+            products = pagedProducts
+        });
+    }
+
+    return Results.Ok(new
+    {
+        merchantId,
+        pagination = new
+        {
+            page,
+            pageSize
+        },
+        filters = new
+        {
+            categoryId
+        },
+        categories = categoryResult
+    });
+}
+
+static async Task<int> ExecuteCountByCategoryAsync(NpgsqlConnection connection, int merchantId, int categoryId, CancellationToken ct)
+{
+    const string sql =
+        """
+        SELECT COUNT(*)
+        FROM "AggregateProducts"
+        WHERE "MerchantId" = @merchantId AND "ProductCategoryId" = @categoryId;
+        """;
+
+    await using var command = new NpgsqlCommand(sql, connection);
+    command.Parameters.AddWithValue("merchantId", merchantId);
+    command.Parameters.AddWithValue("categoryId", categoryId);
+    return Convert.ToInt32(await command.ExecuteScalarAsync(ct));
+}
+
+static async Task<List<object>> LoadCategoryPageAsync(NpgsqlConnection connection, int merchantId, int categoryId, int offset, int pageSize, CancellationToken ct)
+{
+    const string sql =
+        """
+        SELECT "Id", "SortOrder", "Name", "Price"
+        FROM "AggregateProducts"
+        WHERE "MerchantId" = @merchantId AND "ProductCategoryId" = @categoryId
+        ORDER BY "SortOrder", "Id"
+        OFFSET @offset
+        LIMIT @limit;
+        """;
+
+    var items = new List<object>();
+    await using var command = new NpgsqlCommand(sql, connection);
+    command.Parameters.AddWithValue("merchantId", merchantId);
+    command.Parameters.AddWithValue("categoryId", categoryId);
+    command.Parameters.AddWithValue("offset", offset);
+    command.Parameters.AddWithValue("limit", pageSize);
+
+    await using var reader = await command.ExecuteReaderAsync(ct);
+    while (await reader.ReadAsync(ct))
+    {
+        items.Add(new
+        {
+            id = reader.GetInt32(0),
+            sortOrder = reader.GetInt32(1),
+            name = reader.GetString(2),
+            price = reader.GetDecimal(3)
+        });
+    }
+
+    return items;
 }
 

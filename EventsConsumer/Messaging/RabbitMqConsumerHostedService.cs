@@ -111,6 +111,7 @@ public sealed class RabbitMqConsumerHostedService(
                     ProductId = message.ProductId,
                     MerchantId = message.MerchantId,
                     ProductCategoryId = message.ProductCategoryId,
+                    SortOrder = message.SortOrder,
                     Name = message.Name,
                     Price = message.Price,
                     Action = message.Action,

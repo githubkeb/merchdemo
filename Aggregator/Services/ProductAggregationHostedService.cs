@@ -109,6 +109,7 @@ public sealed class ProductAggregationHostedService(
                 "ProductId",
                 "MerchantId",
                 "ProductCategoryId",
+                "SortOrder",
                 "Name",
                 "Price",
                 "Action",
@@ -136,11 +137,12 @@ public sealed class ProductAggregationHostedService(
                 ProductId = reader.GetInt32(1),
                 MerchantId = reader.GetInt32(2),
                 ProductCategoryId = reader.IsDBNull(3) ? null : reader.GetInt32(3),
-                Name = reader.GetString(4),
-                Price = reader.GetDecimal(5),
-                Action = reader.GetString(6),
-                OccurredAtUtc = reader.GetFieldValue<DateTimeOffset>(7),
-                ReceivedAtUtc = reader.GetFieldValue<DateTimeOffset>(8)
+                SortOrder = reader.GetInt32(4),
+                Name = reader.GetString(5),
+                Price = reader.GetDecimal(6),
+                Action = reader.GetString(7),
+                OccurredAtUtc = reader.GetFieldValue<DateTimeOffset>(8),
+                ReceivedAtUtc = reader.GetFieldValue<DateTimeOffset>(9)
             });
         }
 
@@ -226,11 +228,12 @@ public sealed class ProductAggregationHostedService(
         const string upsertSql =
             """
             INSERT INTO "AggregateProducts" (
-                "Id", "MerchantId", "ProductCategoryId", "Name", "Price", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc")
-            VALUES (@id, @merchantId, @productCategoryId, @name, @price, @lastAction, @lastOccurredAtUtc, @updatedAtUtc)
+                "Id", "MerchantId", "ProductCategoryId", "SortOrder", "Name", "Price", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc")
+            VALUES (@id, @merchantId, @productCategoryId, @sortOrder, @name, @price, @lastAction, @lastOccurredAtUtc, @updatedAtUtc)
             ON CONFLICT ("Id") DO UPDATE SET
                 "MerchantId" = EXCLUDED."MerchantId",
                 "ProductCategoryId" = EXCLUDED."ProductCategoryId",
+                "SortOrder" = EXCLUDED."SortOrder",
                 "Name" = EXCLUDED."Name",
                 "Price" = EXCLUDED."Price",
                 "LastAction" = EXCLUDED."LastAction",
@@ -242,6 +245,7 @@ public sealed class ProductAggregationHostedService(
         command.Parameters.AddWithValue("id", productEvent.ProductId);
         command.Parameters.AddWithValue("merchantId", productEvent.MerchantId);
         command.Parameters.AddWithValue("productCategoryId", (object?)resolvedCategoryId ?? DBNull.Value);
+        command.Parameters.AddWithValue("sortOrder", productEvent.SortOrder);
         command.Parameters.AddWithValue("name", productEvent.Name);
         command.Parameters.AddWithValue("price", productEvent.Price);
         command.Parameters.AddWithValue("lastAction", productEvent.Action);

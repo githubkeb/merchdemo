@@ -40,9 +40,9 @@ app.MapGet("/products", async (NpgsqlDataSource dataSource, CancellationToken ct
 	await using var connection = await dataSource.OpenConnectionAsync(ct);
 	const string sql =
 		"""
-		SELECT "Id", "MerchantId", "ProductCategoryId", "Name", "Price", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc"
+		SELECT "Id", "MerchantId", "ProductCategoryId", "SortOrder", "Name", "Price", "LastAction", "LastOccurredAtUtc", "UpdatedAtUtc"
 		FROM "AggregateProducts"
-		ORDER BY "Id";
+		ORDER BY "SortOrder", "Id";
 		""";
 	await using var command = new NpgsqlCommand(sql, connection);
 	await using var reader = await command.ExecuteReaderAsync(ct);
@@ -53,11 +53,12 @@ app.MapGet("/products", async (NpgsqlDataSource dataSource, CancellationToken ct
 			Id = reader.GetInt32(0),
 			MerchantId = reader.GetInt32(1),
 			ProductCategoryId = reader.IsDBNull(2) ? null : reader.GetInt32(2),
-			Name = reader.GetString(3),
-			Price = reader.GetDecimal(4),
-			LastAction = reader.GetString(5),
-			LastOccurredAtUtc = reader.GetFieldValue<DateTimeOffset>(6),
-			UpdatedAtUtc = reader.GetFieldValue<DateTimeOffset>(7)
+			SortOrder = reader.GetInt32(3),
+			Name = reader.GetString(4),
+			Price = reader.GetDecimal(5),
+			LastAction = reader.GetString(6),
+			LastOccurredAtUtc = reader.GetFieldValue<DateTimeOffset>(7),
+			UpdatedAtUtc = reader.GetFieldValue<DateTimeOffset>(8)
 		});
 	}
 	return Results.Ok(products);
@@ -146,6 +147,7 @@ static async Task EnsureAggregateSchemaAsync(NpgsqlDataSource dataSource)
 		    "Id" integer PRIMARY KEY,
 		    "MerchantId" integer NOT NULL,
 		    "ProductCategoryId" integer NULL,
+		    "SortOrder" integer NOT NULL DEFAULT 0,
 		    "Name" character varying(200) NOT NULL,
 		    "Price" numeric(18,2) NOT NULL,
 		    "LastAction" character varying(32) NOT NULL,
@@ -159,6 +161,13 @@ static async Task EnsureAggregateSchemaAsync(NpgsqlDataSource dataSource)
 
 		CREATE INDEX IF NOT EXISTS "IX_AggregateProducts_MerchantId" ON "AggregateProducts" ("MerchantId");
 		CREATE INDEX IF NOT EXISTS "IX_AggregateCategories_MerchantId" ON "AggregateCategories" ("MerchantId");
+		CREATE INDEX IF NOT EXISTS "IX_AggregateProducts_MerchantId_ProductCategoryId_SortOrder_Id"
+		    ON "AggregateProducts" ("MerchantId", "ProductCategoryId", "SortOrder", "Id");
+		CREATE INDEX IF NOT EXISTS "IX_AggregateProducts_MerchantId_Uncategorized_SortOrder_Id"
+		    ON "AggregateProducts" ("MerchantId", "SortOrder", "Id")
+		    WHERE "ProductCategoryId" IS NULL;
+
+		ALTER TABLE "AggregateProducts" ADD COLUMN IF NOT EXISTS "SortOrder" integer NOT NULL DEFAULT 0;
 		""";
 
 	await using var command = new NpgsqlCommand(sql, connection);
